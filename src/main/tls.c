@@ -25,10 +25,16 @@
 RCSID("$Id$")
 USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
+#define STSAFE_ENABLE 1
+
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/process.h>
 #include <freeradius-devel/modules.h>
 #include <freeradius-devel/rad_assert.h>
+
+#ifdef STSAFE_ENABLE
+#include <sys/random.h>
+#endif
 
 #ifdef HAVE_SYS_STAT_H
 #include <sys/stat.h>
@@ -64,11 +70,24 @@ USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
 #  include <openssl/provider.h>
 
+#ifdef STSAFE_ENABLE
+#include <openssl/engine.h>
+#endif
+
+
 static OSSL_PROVIDER *openssl_default_provider = NULL;
 static OSSL_PROVIDER *openssl_legacy_provider = NULL;
 #endif
 
 #define LOG_PREFIX "tls"
+
+#ifdef STSAFE_ENABLE
+static ENGINE *stsafe_engine = NULL;
+const char *engine_id = "Stsafe";
+const char *stsafe_memory_region = "1";
+const char *stsafe_sig_key_slot = "1";
+const char *stsafe_gen_key_slot = "255";
+#endif
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
 #define ERR_get_error_line(_file, _line) ERR_get_error_all(_file, _line, NULL, NULL, NULL)
@@ -3719,6 +3738,18 @@ void tls_global_cleanup(void)
 	ERR_free_strings();
 	EVP_cleanup();
 	CRYPTO_cleanup_all_ex_data();
+
+#ifdef STSAFE_ENABLE
+if (stsafe_engine != NULL) {
+    if (! ENGINE_finish(stsafe_engine)) {
+            ERROR("ENGINE_finish failed");
+    }
+    if (! ENGINE_free(stsafe_engine)) {
+            ERROR("ENGINE_free failed");
+    }
+}
+#endif
+
 }
 
 
@@ -3754,6 +3785,9 @@ static const FR_NAME_NUMBER version2int[] = {
 SSL_CTX *tls_init_ctx(fr_tls_server_conf_t *conf, int client, char const *chain_file, char const *private_key_file)
 {
 	SSL_CTX		*ctx;
+#ifdef STSAFE_ENABLE
+	EVP_PKEY *privkey = NULL;
+#endif
 	X509_STORE	*certstore;
 	int		verify_mode = SSL_VERIFY_NONE;
 	int		ctx_options = 0, ctx_available = 0;
@@ -3763,6 +3797,11 @@ SSL_CTX *tls_init_ctx(fr_tls_server_conf_t *conf, int client, char const *chain_
 #endif
 	int		min_version;
 	int		max_version;
+#ifdef STSAFE_ENABLE
+    size_t rand_bytes = 32;
+    float entropy_estimate = 0.5;
+    uint8_t rndseed[rand_bytes];
+#endif
 
 	/*
 	 *	SHA256 is in all versions of OpenSSL, but isn't
@@ -4010,7 +4049,86 @@ load_ca:
 		DEBUG2("ca_path_reload_interval is set too low, reset it to 300");
 		conf->ca_path_reload_interval = 300;
 	}
+#ifdef STSAFE_ENABLE
+    //ENGINE_load_builtin_engines();
+    stsafe_engine = ENGINE_by_id(engine_id);
+    if(!stsafe_engine) {
+        /* the engine isn't available */
+        ERROR(LOG_PREFIX ": Stsafe engine cant be loaded");
+        return NULL;
+    }
+    if(!ENGINE_init(stsafe_engine)) {
+        /* the engine couldn't initialise, release 'e' */
+        ERROR(LOG_PREFIX ": Stsafe engine cant be loaded");
+        ENGINE_free(stsafe_engine);
+        return NULL;
+    }
+    if(!ENGINE_set_default(stsafe_engine, ENGINE_METHOD_ALL)) {
+        /* This should only happen when 'e' can't initialise, but the previous
+         * statement suggests it did. */
+        ERROR(LOG_PREFIX ": Stsafe engine cant be loaded");
+        ENGINE_free(stsafe_engine);
+    }
 
+    // Set STSAFE engine slots
+    if (!ENGINE_ctrl_cmd_string(stsafe_engine, "SET_SIG_KEY_SLOT", stsafe_sig_key_slot, 0)) {
+        ERROR(LOG_PREFIX ": Stsafe failed SET_SIG_KEY_SLOT");
+        ENGINE_free(stsafe_engine);
+        return NULL;
+    }
+    if (!ENGINE_ctrl_cmd_string(stsafe_engine, "SET_GEN_KEY_SLOT", stsafe_gen_key_slot, 0)) {
+        ERROR(LOG_PREFIX ": Stsafe failed SET_GEN_KEY_SLOT");
+        ENGINE_free(stsafe_engine);
+        return NULL;
+    }
+    if (!ENGINE_ctrl_cmd_string(stsafe_engine, "SET_MEMORY_REGION", stsafe_memory_region, 0)) {
+        ERROR(LOG_PREFIX ": Stsafe failed SET_MEMORY_REGION");
+        ENGINE_free(stsafe_engine);
+        return NULL;
+    }
+    //ENGINE_set_default_ciphers(stsafe_engine);
+    if (getrandom(rndseed, sizeof(rndseed), GRND_NONBLOCK)) {
+        //RAND_add(rndseed, sizeof(rndseed), 0); // add entropy without increasing estimate
+        //RAND_seed(rndseed, sizeof(rndseed); // add entropy and increase estimate by 100% of buffer size
+        RAND_add(rndseed, sizeof(rndseed), rand_bytes * entropy_estimate);
+        memset(rndseed, 0, sizeof(rndseed));
+        INFO("stsafe seeding RAND_add with %f bytes from getrandom()", rand_bytes * entropy_estimate);
+    }
+    else {
+        ERROR("Error seeding RAND_add with %f bytes from getrandom()", rand_bytes * entropy_estimate);
+    }
+    /* Load private key */
+    if (stsafe_engine != NULL) {
+        privkey = ENGINE_load_private_key(stsafe_engine, NULL, NULL, NULL);
+        if (privkey == NULL) {
+            ERROR(LOG_PREFIX "ENGINE failed loading private key");
+            ENGINE_free(stsafe_engine);
+            return NULL;
+        }
+        else {
+            INFO(LOG_PREFIX "ENGINE success loading Stsafe private key.");
+        }
+        if (!(SSL_CTX_use_PrivateKey(ctx, privkey))) {
+            tls_error_log(NULL, "Failed reading Stsafe private key");
+        ENGINE_free(stsafe_engine);
+            return NULL;
+        }
+        else {
+            INFO(LOG_PREFIX "ENGINE success reading Stsafe private key.");
+        }
+        if (!SSL_CTX_check_private_key(ctx)) {
+            ERROR(LOG_PREFIX ": Stsafe private key does not match the certificate public key");
+            ENGINE_free(stsafe_engine);
+            return NULL;
+        }
+        else {
+            INFO(LOG_PREFIX "ENGINE certificates matches Stsafe private key.");
+        }
+
+        EVP_PKEY_free(privkey);
+
+    }
+#else
 	/* Load private key */
 	if (!private_key_file) private_key_file = conf->private_key_file;
 	if (private_key_file) {
@@ -4028,6 +4146,7 @@ load_ca:
 			return NULL;
 		}
 	}
+#endif
 
 #ifdef PSK_MAX_IDENTITY_LEN
 post_ca:
